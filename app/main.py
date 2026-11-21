@@ -9,19 +9,35 @@ longest-prefix-match results for every destination address — with "drop"
 and "no-match" kept distinct — both before and after withdrawing the
 failed next-hop from old and new tables.  When the minimum does not fit
 the capacity, only the minimum required entry count is reported.
+
+The service also offers a second, independent tool for ECMP groups
+identified by an action in the forwarding table: given the group's hash
+buckets (current next-hop, bytes and active connections in one sampling
+window) and the retained next-hops with their required bucket counts and
+byte budgets, it returns a deployable bucket-to-next-hop mapping that
+honours every count and budget while minimizing the active connections
+that have to move away from their current next-hop.  Uplink maintenance:
+remove one next-hop, rearrange the buckets before it leaves service.
 """
 
 from __future__ import annotations
 
 from ipaddress import IPv4Network, ip_network
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from fastapi import Body, FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .compressor import DROP, compress, verify
+from .ecmp import (
+    MAX_BUCKETS,
+    MAX_RETAINED,
+    Bucket,
+    RetainedTarget,
+    rearrange_buckets,
+)
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 MAX_ROUTES = 128
 
 # ---------------------------------------------------------------------------
@@ -78,6 +94,43 @@ EXAMPLE_FAILOVER_LADDER = {
         ],
         "capacity": 8,
         "failed_nexthop": "NH2",
+    },
+}
+
+# 8-bucket ECMP group "ecmp-core" spread over NH1/NH2/NH3/NH4.  NH2's uplink
+# is going into maintenance, so its 2 buckets must move to the retained
+# next-hops.  NH1 and NH3 must each end up with 3 buckets, NH4 with 2.
+# Optimal: NH2's heavy bucket 3 goes to NH3 (which already has 2 of its own),
+# NH2's light bucket 4 joins NH4's existing bucket 7, and every bucket that
+# is already on a retained next-hop stays put.  Only buckets 3 and 4 move,
+# migrating 2100 + 700 = 2800 active connections.
+EXAMPLE_ECMP_REARRANGE = {
+    "summary": "摘除上联：ECMP 组 8 个哈希桶重排到保留下一跳",
+    "description": (
+        "组 ecmp-core 原有 8 个哈希桶分布在 NH1/NH2/NH3/NH4；NH2 即将检修，"
+        "其桶必须全部改走保留下一跳。保留目标为 NH1 3 桶、NH3 3 桶、NH4 2 桶，"
+        "各自给出同一采样窗口的字节预算。求解器在满足桶数与预算的前提下，"
+        "让改走其他下一跳的活跃连接总数最少：只需迁移 NH2 的两个桶，共 2800 条连接。"
+        "若预算过紧则只返回 feasible=false。"
+    ),
+    "value": {
+        "group": "ecmp-core",
+        "removed_nexthop": "NH2",
+        "buckets": [
+            {"bucket": 0, "current_nexthop": "NH1", "bytes_in_window": 4_200_000_000, "active_connections": 1200},
+            {"bucket": 1, "current_nexthop": "NH1", "bytes_in_window": 3_800_000_000, "active_connections": 900},
+            {"bucket": 2, "current_nexthop": "NH1", "bytes_in_window": 4_600_000_000, "active_connections": 1500},
+            {"bucket": 3, "current_nexthop": "NH2", "bytes_in_window": 5_000_000_000, "active_connections": 2100},
+            {"bucket": 4, "current_nexthop": "NH2", "bytes_in_window": 2_400_000_000, "active_connections": 700},
+            {"bucket": 5, "current_nexthop": "NH3", "bytes_in_window": 3_100_000_000, "active_connections": 800},
+            {"bucket": 6, "current_nexthop": "NH3", "bytes_in_window": 2_900_000_000, "active_connections": 650},
+            {"bucket": 7, "current_nexthop": "NH4", "bytes_in_window": 1_800_000_000, "active_connections": 400},
+        ],
+        "retained": [
+            {"nexthop": "NH1", "bucket_count": 3, "byte_budget": 15_000_000_000},
+            {"nexthop": "NH3", "bucket_count": 3, "byte_budget": 14_000_000_000},
+            {"nexthop": "NH4", "bucket_count": 2, "byte_budget": 5_000_000_000},
+        ],
     },
 }
 
@@ -186,6 +239,118 @@ class VerifyResponse(BaseModel):
     first_mismatch: Optional[dict] = None
 
 
+class EcmpBucket(BaseModel):
+    """One hash bucket of an ECMP group in the current sampling window."""
+
+    bucket: int = Field(ge=0, examples=[3], description="Bucket number.")
+    current_nexthop: str = Field(
+        min_length=1, max_length=64, examples=["NH2"],
+        description="Next-hop this bucket currently hashes to.",
+    )
+    bytes_in_window: int = Field(
+        ge=0, examples=[5_000_000_000],
+        description="Bytes carried by this bucket in the sampling window.",
+    )
+    active_connections: int = Field(
+        ge=0, examples=[2100],
+        description="Active connections carried by this bucket in the same window.",
+    )
+
+    @field_validator("current_nexthop")
+    @classmethod
+    def _check_hop(cls, v: str) -> str:
+        h = v.strip()
+        if not h:
+            raise ValueError("current_nexthop must be non-empty")
+        return h
+
+
+class EcmpRetained(BaseModel):
+    """A next-hop that stays in service, with its bucket and byte targets."""
+
+    nexthop: str = Field(min_length=1, max_length=64, examples=["NH1"])
+    bucket_count: int = Field(
+        ge=0, examples=[3],
+        description="Exact number of buckets this next-hop must carry.",
+    )
+    byte_budget: int = Field(
+        ge=0, examples=[15_000_000_000],
+        description="Upper bound on the bytes assigned to it in the same window.",
+    )
+
+    @field_validator("nexthop")
+    @classmethod
+    def _check_hop(cls, v: str) -> str:
+        h = v.strip()
+        if not h:
+            raise ValueError("nexthop must be non-empty")
+        return h
+
+
+class EcmpRearrangeRequest(BaseModel):
+    group: str = Field(
+        min_length=1, max_length=64, examples=["ecmp-core"],
+        description="ECMP group name (the action identifying it in the FIB).",
+    )
+    removed_nexthop: str = Field(
+        min_length=1, max_length=64, examples=["NH2"],
+        description="Next-hop being taken out of service; all its buckets must move.",
+    )
+    buckets: List[EcmpBucket] = Field(
+        max_length=MAX_BUCKETS,
+        description=f"Up to {MAX_BUCKETS} buckets with distinct numbers.",
+    )
+    retained: List[EcmpRetained] = Field(
+        max_length=MAX_RETAINED,
+        description=(
+            f"Up to {MAX_RETAINED} retained next-hops with the exact bucket "
+            "count and byte budget each must receive."
+        ),
+    )
+
+    @field_validator("group", "removed_nexthop")
+    @classmethod
+    def _check_name(cls, v: str) -> str:
+        s = v.strip()
+        if not s:
+            raise ValueError("must be non-empty")
+        return s
+
+    @model_validator(mode="after")
+    def _coherent(self):
+        numbers = [b.bucket for b in self.buckets]
+        if len(set(numbers)) != len(numbers):
+            raise ValueError("bucket numbers must be distinct")
+        hops = [r.nexthop for r in self.retained]
+        if len(set(hops)) != len(hops):
+            raise ValueError("retained next-hops must be distinct")
+        if self.removed_nexthop in set(hops):
+            raise ValueError("removed_nexthop cannot also be a retained next-hop")
+        return self
+
+
+class EcmpRearrangeResponse(BaseModel):
+    feasible: bool = Field(
+        description="Whether every count and byte-budget constraint can be met."
+    )
+    group: str
+    removed_nexthop: str
+    assignment: Optional[Dict[int, str]] = Field(
+        default=None,
+        description=(
+            "Bucket number -> retained next-hop, ready to deploy; null when "
+            "infeasible."
+        ),
+    )
+    migrated_connections: Optional[int] = Field(
+        default=None,
+        description=(
+            "Active connections whose bucket changes next-hop; null when "
+            "infeasible.  Minimized over all feasible assignments."
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # application
 # ---------------------------------------------------------------------------
@@ -194,12 +359,15 @@ app = FastAPI(
     title="FIB Compressor",
     version=APP_VERSION,
     description=(
-        "Compress an IPv4 forwarding table for a smaller-capacity edge router. "
-        "The compressed table is entry-minimal and equivalent under "
+        "Two tools for an edge-router change window. "
+        "(1) Compress an IPv4 forwarding table for a smaller-capacity router: "
+        "the compressed table is entry-minimal and equivalent under "
         "longest-prefix matching — distinguishing drop from no-match — both "
         "before and after a next-hop failure drill. "
-        "Try the ready-made examples below: one where the capacity suffices "
-        "and one where only the minimum required count is reported."
+        "(2) Rearrange the hash buckets of an ECMP group before one uplink "
+        "next-hop is removed: exact bucket counts and byte budgets per "
+        "retained next-hop, with the fewest active connections moved. "
+        "Try the ready-made examples below."
     ),
 )
 
@@ -212,9 +380,14 @@ def root():
         "endpoints": {
             "POST /compress": "minimal equivalent table (or minimum count when over capacity)",
             "POST /verify": "check two tables for normal + failover equivalence",
+            "POST /ecmp/rearrange": "bucket-to-next-hop mapping for a draining uplink",
             "GET /docs": "interactive demo",
         },
-        "limits": {"max_routes": MAX_ROUTES},
+        "limits": {
+            "max_routes": MAX_ROUTES,
+            "max_ecmp_buckets": MAX_BUCKETS,
+            "max_retained_nexthops": MAX_RETAINED,
+        },
         "reserved_action": DROP,
     }
 
@@ -268,3 +441,40 @@ def verify_endpoint(req: VerifyRequest):
     new = [(IPv4Network(r.prefix), r.action) for r in req.new_routes]
     ok, detail = verify(old, new, req.failed_nexthop)
     return VerifyResponse(equivalent=ok, **detail)
+
+
+@app.post(
+    "/ecmp/rearrange",
+    response_model=EcmpRearrangeResponse,
+    summary="Rearrange ECMP buckets around a draining next-hop",
+)
+def ecmp_rearrange_endpoint(
+    req: EcmpRearrangeRequest = Body(
+        openapi_examples={"remove_uplink": EXAMPLE_ECMP_REARRANGE}
+    )
+):
+    buckets = [
+        Bucket(
+            bucket=b.bucket,
+            current_nexthop=b.current_nexthop,
+            bytes_in_window=b.bytes_in_window,
+            active_connections=b.active_connections,
+        )
+        for b in req.buckets
+    ]
+    targets = [
+        RetainedTarget(
+            nexthop=r.nexthop,
+            bucket_count=r.bucket_count,
+            byte_budget=r.byte_budget,
+        )
+        for r in req.retained
+    ]
+    result = rearrange_buckets(buckets, req.removed_nexthop, targets)
+    return EcmpRearrangeResponse(
+        feasible=result.feasible,
+        group=req.group,
+        removed_nexthop=req.removed_nexthop,
+        assignment=result.bucket_to_nexthop,
+        migrated_connections=result.migrated_connections,
+    )
